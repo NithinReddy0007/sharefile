@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Rooms and their files are managed only by backend (Cloud Functions with admin SDK)
+    // No direct client access needed
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

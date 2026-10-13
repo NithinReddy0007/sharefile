@@ -24,9 +24,12 @@ lerna-debug.log*
 .env.test.local
 .env.production.local
 
-# Cloudflare Wrangler
-.wrangler/
-.mf/
+# Firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+storage-debug.log
+functions/lib/
 
 # Editor directories
 .vscode/*

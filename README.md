@@ -1,178 +1,115 @@
 # Qshare
 
-> Lightweight, zero-account temporary file-sharing web application built with React, Vite, TypeScript, Cloudflare Workers, Cloudflare D1, and Cloudflare R2.
+> Lightweight, zero-account temporary file-sharing web app built with React, Vite, TypeScript, and Firebase (Functions + Firestore + Storage).
 
 ---
 
 ## Architecture Overview
 
-- **Frontend**: Single-page application built with React 19, TypeScript, and Vite. Styled with clean, responsive modern CSS.
-- **Backend API**: Cloudflare Worker handling room creation, credential validation, file streaming to R2, and scheduled cleanup cron jobs.
-- **Database**: Cloudflare D1 (serverless SQLite) storing room codes, salted passcode hashes, file metadata, and expiration timestamps.
-- **Storage**: Cloudflare R2 bucket storing uploaded file objects.
-- **Frontend Hosting**: Static hosting via GitHub Pages with GitHub Actions CI/CD.
+- **Frontend**: React 19 + TypeScript + Vite. Hosted on GitHub Pages.
+- **Backend API**: Firebase Cloud Functions (Node.js) — room creation, passcode auth, signed URL generation, scheduled cleanup.
+- **Database**: Firestore — room metadata, file metadata, expiration timestamps.
+- **Storage**: Firebase Storage — uploaded file objects, accessed via short-lived signed URLs.
+
+Files upload **directly from the browser to Firebase Storage** via signed URLs (no data flows through the Function), so uploads are fast and not bottlenecked by function memory.
 
 ---
 
-## Free-Tier Allowances & Cloudflare Limits
-
-*(Verified from official Cloudflare documentation as of October 2024)*
-
-1. **Cloudflare Workers (Free Plan)**:
-   - 100,000 requests per day across all Workers.
-   - Max 10ms CPU time per request.
-   - Cron Triggers supported.
-   - [Cloudflare Workers Limits](https://developers.cloudflare.com/workers/platform/limits/)
-
-2. **Cloudflare D1 (Free Plan)**:
-   - 5 million rows read per month.
-   - 100,000 rows written per month.
-   - 5 GB total database storage across account.
-   - [Cloudflare D1 Pricing & Limits](https://developers.cloudflare.com/d1/platform/pricing/)
-
-3. **Cloudflare R2 (Free Plan)**:
-   - 10 GB-months of stored data per month.
-   - 1,000,000 Class A operations (create/upload/write) per month.
-   - 10,000,000 Class B operations (read/download) per month.
-   - **Zero egress bandwidth charges** (no egress fees for downloads).
-   - [Cloudflare R2 Pricing](https://developers.cloudflare.com/r2/pricing/)
-
----
-
-## Local Development Setup
+## Local Development
 
 ### 1. Prerequisites
-- **Node.js** v18+ or v20+ installed.
-- **npm** v9+ installed.
+- Node.js v18+ / npm v9+
+- Firebase CLI: `npm install -g firebase-tools`
 
-### 2. Install Dependencies
+### 2. Install dependencies
 ```bash
-# Install frontend dependencies
+# Frontend
 npm --prefix frontend install
 
-# Install worker dependencies
-npm --prefix worker install
+# Firebase Functions
+npm --prefix functions install
 ```
 
-### 3. Configure Local Environment
-Create a `.env` file in the `frontend` folder:
+### 3. Configure environment
 ```bash
 cp .env.example frontend/.env
 ```
-Ensure `frontend/.env` contains:
+Edit `frontend/.env` and set:
 ```env
-VITE_API_BASE_URL=http://127.0.0.1:8787
+# Replace <project-id> with your actual Firebase project ID
+VITE_API_BASE_URL=http://127.0.0.1:5001/<project-id>/us-central1/api
 ```
 
-### 4. Initialize Local D1 Database
-In the `worker` directory, apply the database migration locally:
+### 4. Start emulators + frontend
+
+Terminal 1 – Firebase emulators:
 ```bash
-cd worker
-npx wrangler d1 execute qshare-db --local --file=./migrations/0001_initial_schema.sql
-cd ..
+firebase emulators:start --only functions,firestore,storage
 ```
 
-### 5. Run the Application Locally
-
-In terminal 1 (start Cloudflare Worker API locally):
+Terminal 2 – Vite frontend:
 ```bash
-npm run dev:worker
-# Or: cd worker && npx wrangler dev
+npm --prefix frontend run dev
 ```
-The Worker will run on `http://127.0.0.1:8787`.
 
-In terminal 2 (start Vite React frontend):
-```bash
-npm run dev:frontend
-# Or: cd frontend && npm run dev
-```
-Open `http://localhost:5173` in your browser.
+Open `http://localhost:5173`.
 
 ---
 
-## Cloudflare Deployment
+## Firebase Deployment
 
-### 1. Log in to Wrangler
-```bash
-npx wrangler login
-```
+### 1. Create a Firebase project
+Go to [console.firebase.google.com](https://console.firebase.google.com) and create a new project.
 
-### 2. Create the Cloudflare D1 Database
+### 2. Log in and select project
 ```bash
-npx wrangler d1 create qshare-db
-```
-Wrangler will output configuration information with a `database_id`.
-Open `worker/wrangler.toml` and replace `database_id = "local-qshare-db"` with your actual D1 ID:
-```toml
-[[d1_databases]]
-binding = "DB"
-database_name = "qshare-db"
-database_id = "<YOUR_ACTUAL_D1_DATABASE_ID>"
-migrations_dir = "migrations"
+firebase login
+firebase use --add   # pick your project
 ```
 
-Apply migrations to production:
-```bash
-cd worker
-npx wrangler d1 migrations apply qshare-db --remote
-cd ..
-```
+### 3. Enable required services in the Firebase console
+- **Firestore** → Create database (production mode)
+- **Storage** → Get started
+- **Functions** → (requires Blaze pay-as-you-go plan)
 
-### 3. Create the Cloudflare R2 Bucket
+### 4. Deploy everything
 ```bash
-npx wrangler r2 bucket create qshare-files
+firebase deploy
 ```
+This deploys Functions, Firestore rules, and Storage rules in one step.
 
-### 4. Deploy the Worker
-```bash
-cd worker
-npx wrangler deploy
-cd ..
+### 5. Get your Function URL
+After deploy you'll see something like:
 ```
-Note your deployed Worker URL (e.g., `https://qshare-api.<your-subdomain>.workers.dev`).
+Function URL (api): https://us-central1-<project-id>.cloudfunctions.net/api
+```
+Set that as `VITE_API_BASE_URL` in your GitHub repository variables.
 
 ---
 
 ## GitHub Pages Deployment
 
-The repository includes the official GitHub Pages deployment workflow at `.github/workflows/deploy.yml`.
+The repository includes `.github/workflows/deploy.yml` for automatic builds on push to `main`.
 
-### 1. Configure GitHub Repository Settings
-1. Go to your repository on GitHub: `https://github.com/NithinReddy0007/sharefile`.
-2. Navigate to **Settings** > **Pages**.
-3. Under **Build and deployment** > **Source**, select **GitHub Actions** (do NOT choose "Deploy from a branch").
-4. (Optional) In **Settings** > **Secrets and variables** > **Actions** > **Variables**, configure:
-   - Name: `VITE_API_BASE_URL`
-   - Value: `https://qshare-api.<your-subdomain>.workers.dev` (your deployed Worker API URL)
-
-### 2. Automatic Deployment
-Every push to the `main` branch triggers `.github/workflows/deploy.yml`, which:
-- Installs dependencies in `frontend/`
-- Builds the React app with `base: "/sharefile/"`
-- Uploads `frontend/dist/` directly as the Pages artifact (with `index.html` at the root)
-- Deploys the actual React application to: `https://nithinreddy0007.github.io/sharefile/`
+In GitHub → Settings → Secrets and variables → Actions → **Variables**:
+- `VITE_API_BASE_URL` = `https://us-central1-<project-id>.cloudfunctions.net/api`
 
 ---
 
-## Scheduled Cleanup Mechanism
+## Scheduled Cleanup
 
-Rooms expire exactly 30 minutes after creation.
-The Cloudflare Worker includes an automatic Cron trigger defined in `worker/wrangler.toml`:
-```toml
-[triggers]
-crons = ["*/10 * * * *"]
-```
-Every 10 minutes, the Cloudflare scheduler executes `cleanupExpiredRooms(env)`. This:
-1. Queries all rooms where `expires_at <= current_time`.
-2. Issues `env.BUCKET.delete(keys)` for all associated R2 files.
-3. Deletes room and file records from D1 in a batch transaction.
-
-In addition, rooms are immediately blocked from downloads and uploads upon expiration via real-time timestamp checks on every API request.
+Rooms expire 30 minutes after creation. The `cleanup` Cloud Function runs on a schedule every 10 minutes, marks expired rooms, and deletes their Storage files from Firestore.
 
 ---
 
-## Running Tests
-Run the automated test suite for backend room generation, hashing, capacity limits, and expiration:
-```bash
-npm run test:worker
-```
+## Firebase Free Tier Limits (Spark plan)
+
+| Resource | Free allowance |
+|---|---|
+| Cloud Functions invocations | 2M / month |
+| Firestore reads | 50K / day |
+| Firestore writes | 20K / day |
+| Storage stored data | 5 GB |
+| Storage download | 1 GB / day |
+
+> **Note**: Scheduled Cloud Functions (Cloud Scheduler) require the **Blaze** (pay-as-you-go) plan. All other services work on the free Spark plan.

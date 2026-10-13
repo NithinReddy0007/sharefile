@@ -1,0 +1,24 @@
+{
+  "name": "qshare-functions",
+  "version": "1.0.0",
+  "description": "Firebase Cloud Functions backend for Qshare",
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "serve": "npm run build && firebase emulators:start --only functions,firestore,storage",
+    "deploy": "firebase deploy --only functions"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.0",
+    "firebase-functions": "^6.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0"
+  },
+  "private": true
+}
