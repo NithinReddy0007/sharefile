@@ -10,6 +10,8 @@ export async function createRoom(): Promise<{
   expiresAt: number;
   maxFileSizeBytes: number;
   maxRoomSizeBytes: number;
+  maxFilesPerRoom: number;
+  maxConcurrentUploads: number;
 }> {
   const res = await fetch(`${API_BASE_URL}/api/rooms`, {
     method: 'POST',
@@ -48,7 +50,7 @@ export interface UploadProgressCallback {
 /**
  * Upload a file to the room.
  * For files <= 50MB: Single direct PUT with progress tracking via XMLHttpRequest.
- * For files > 50MB up to 500MB: Multipart chunked upload (chunks of 10MB) with resume and progress.
+ * For files > 50MB up to 100MB: Multipart chunked upload (chunks of 10MB) with resume and progress.
  */
 export async function uploadFileToRoom(
   roomId: string,

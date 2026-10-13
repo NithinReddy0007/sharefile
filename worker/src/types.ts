@@ -5,6 +5,8 @@ export interface Env {
   MAX_FILE_SIZE_BYTES?: string | number;
   MAX_ROOM_SIZE_BYTES?: string | number;
   ROOM_TTL_SECONDS?: string | number;
+  MAX_FILES_PER_ROOM?: string | number;
+  MAX_CONCURRENT_UPLOADS?: string | number;
 }
 
 export interface RoomRecord {

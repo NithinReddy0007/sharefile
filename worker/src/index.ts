@@ -10,7 +10,7 @@ import {
 // In-memory or timestamp-based rate limiter per IP
 const ipRateLimits = new Map<string, { count: number; resetAt: number }>();
 
-function checkRateLimit(ip: string, limit = 60, windowMs = 60_000): boolean {
+function checkRateLimit(ip: string, limit = 120, windowMs = 60_000): boolean {
   const now = Date.now();
   const entry = ipRateLimits.get(ip);
   if (!entry || now > entry.resetAt) {
@@ -52,12 +52,13 @@ export function jsonResponse(data: any, status = 200, corsHeaders?: Headers): Re
 }
 
 /**
- * Clean up expired rooms and their R2 objects
+ * Clean up expired rooms and their R2 objects.
+ * Also cleans up stale uncompleted pending files older than 15 minutes.
  */
 export async function cleanupExpiredRooms(env: Env): Promise<{ deletedRooms: number; deletedFiles: number }> {
   const now = Math.floor(Date.now() / 1000);
 
-  // Find up to 50 expired or marked rooms to clean up per cycle
+  // 1. Find up to 50 expired or marked rooms to clean up per cycle
   const expiredRooms = await env.DB.prepare(
     `SELECT id FROM rooms WHERE expires_at <= ? OR status = 'expired' LIMIT 50`
   ).bind(now).all<RoomRecord>();
@@ -65,34 +66,62 @@ export async function cleanupExpiredRooms(env: Env): Promise<{ deletedRooms: num
   let deletedRoomsCount = 0;
   let deletedFilesCount = 0;
 
-  if (!expiredRooms.results || expiredRooms.results.length === 0) {
-    return { deletedRooms: 0, deletedFiles: 0 };
+  if (expiredRooms.results && expiredRooms.results.length > 0) {
+    for (const room of expiredRooms.results) {
+      // Get all files for this room
+      const files = await env.DB.prepare(
+        `SELECT id, storage_key, upload_id FROM files WHERE room_id = ?`
+      ).bind(room.id).all<{ id: string; storage_key: string; upload_id?: string | null }>();
+
+      if (files.results && files.results.length > 0) {
+        // Abort any lingering multipart uploads and delete objects from R2
+        for (const f of files.results) {
+          if (f.upload_id) {
+            try {
+              const mp = env.BUCKET.resumeMultipartUpload(f.storage_key, f.upload_id);
+              await mp.abort();
+            } catch {}
+          }
+        }
+
+        const keys = files.results.map(f => f.storage_key);
+        try {
+          await env.BUCKET.delete(keys);
+          deletedFilesCount += keys.length;
+        } catch (err) {
+          console.error(`Failed to delete R2 files for room ${room.id}:`, err);
+        }
+      }
+
+      // Delete database records
+      await env.DB.batch([
+        env.DB.prepare(`DELETE FROM files WHERE room_id = ?`).bind(room.id),
+        env.DB.prepare(`DELETE FROM rooms WHERE id = ?`).bind(room.id)
+      ]);
+
+      deletedRoomsCount++;
+    }
   }
 
-  for (const room of expiredRooms.results) {
-    // 1. Get all files for this room
-    const files = await env.DB.prepare(
-      `SELECT id, storage_key FROM files WHERE room_id = ?`
-    ).bind(room.id).all<{ id: string; storage_key: string }>();
+  // 2. Clean up stale abandoned pending files (> 15 minutes old in active rooms)
+  const stalePendingCutoff = now - 900;
+  const stalePendingFiles = await env.DB.prepare(
+    `SELECT id, room_id, storage_key, upload_id FROM files WHERE status = 'pending' AND created_at <= ? LIMIT 50`
+  ).bind(stalePendingCutoff).all<{ id: string; room_id: string; storage_key: string; upload_id?: string | null }>();
 
-    if (files.results && files.results.length > 0) {
-      // Delete objects from R2
-      const keys = files.results.map(f => f.storage_key);
-      try {
-        await env.BUCKET.delete(keys);
-        deletedFilesCount += keys.length;
-      } catch (err) {
-        console.error(`Failed to delete R2 files for room ${room.id}:`, err);
+  if (stalePendingFiles.results && stalePendingFiles.results.length > 0) {
+    for (const f of stalePendingFiles.results) {
+      if (f.upload_id) {
+        try {
+          const mp = env.BUCKET.resumeMultipartUpload(f.storage_key, f.upload_id);
+          await mp.abort();
+        } catch {}
       }
+      try {
+        await env.BUCKET.delete(f.storage_key);
+      } catch {}
+      await env.DB.prepare(`DELETE FROM files WHERE id = ?`).bind(f.id).run();
     }
-
-    // 2. Delete database records
-    await env.DB.batch([
-      env.DB.prepare(`DELETE FROM files WHERE room_id = ?`).bind(room.id),
-      env.DB.prepare(`DELETE FROM rooms WHERE id = ?`).bind(room.id)
-    ]);
-
-    deletedRoomsCount++;
   }
 
   return { deletedRooms: deletedRoomsCount, deletedFiles: deletedFilesCount };
@@ -124,6 +153,12 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, ''); // strip trailing slash
 
+    const maxFileSizeBytes = Number(env.MAX_FILE_SIZE_BYTES || 104857600); // 100 MiB default
+    const maxRoomSizeBytes = Number(env.MAX_ROOM_SIZE_BYTES || 524288000); // 500 MiB default
+    const maxFilesPerRoom = Number(env.MAX_FILES_PER_ROOM || 20);
+    const maxConcurrentUploads = Number(env.MAX_CONCURRENT_UPLOADS || 3);
+    const roomTtlSeconds = Number(env.ROOM_TTL_SECONDS || 1800);
+
     try {
       // Health check & cleanup trigger route
       if (path === '' || path === '/api/health') {
@@ -135,7 +170,7 @@ export default {
         }, 200, corsHeaders);
       }
 
-      // Explicit cleanup trigger endpoint (can be called manually or by external webhooks)
+      // Explicit cleanup trigger endpoint
       if (path === '/api/cleanup' && request.method === 'POST') {
         const result = await cleanupExpiredRooms(env);
         return jsonResponse({ success: true, ...result }, 200, corsHeaders);
@@ -146,8 +181,7 @@ export default {
       // ==========================================
       if (path === '/api/rooms' && request.method === 'POST') {
         const now = Math.floor(Date.now() / 1000);
-        const ttl = Number(env.ROOM_TTL_SECONDS || 1800); // 30 minutes default
-        const expiresAt = now + ttl;
+        const expiresAt = now + roomTtlSeconds;
 
         const roomId = generateRoomId();
         const passcode = generatePasscode();
@@ -166,8 +200,10 @@ export default {
             passcode,
             createdAt: now,
             expiresAt,
-            maxFileSizeBytes: Number(env.MAX_FILE_SIZE_BYTES || 524288000), // 500 MB
-            maxRoomSizeBytes: Number(env.MAX_ROOM_SIZE_BYTES || 1073741824)  // 1 GB
+            maxFileSizeBytes,
+            maxRoomSizeBytes,
+            maxFilesPerRoom,
+            maxConcurrentUploads
           }
         }, 201, corsHeaders);
       }
@@ -203,7 +239,6 @@ export default {
 
       const now = Math.floor(Date.now() / 1000);
       if (room.expires_at <= now || room.status !== 'active') {
-        // Mark room as expired if not already
         if (room.status === 'active') {
           await env.DB.prepare(`UPDATE rooms SET status = 'expired' WHERE id = ?`).bind(roomId).run();
         }
@@ -214,9 +249,6 @@ export default {
       if (!isAuthorized) {
         return jsonResponse({ success: false, error: 'Invalid room passcode' }, 403, corsHeaders);
       }
-
-      const maxFileSizeBytes = Number(env.MAX_FILE_SIZE_BYTES || 524288000); // 500 MB
-      const maxRoomSizeBytes = Number(env.MAX_ROOM_SIZE_BYTES || 1073741824); // 1 GB
 
       // ==========================================
       // 2. GET ROOM DETAILS: GET /api/rooms/:roomId
@@ -236,6 +268,8 @@ export default {
             totalSizeBytes: room.total_size_bytes,
             maxFileSizeBytes,
             maxRoomSizeBytes,
+            maxFilesPerRoom,
+            maxConcurrentUploads,
             files: files.results || []
           }
         }, 200, corsHeaders);
@@ -250,26 +284,47 @@ export default {
         const sizeBytes = Number(body.sizeBytes);
         const contentType = body.contentType || 'application/octet-stream';
 
-        if (!sizeBytes || sizeBytes <= 0) {
+        if (!sizeBytes || isNaN(sizeBytes) || sizeBytes <= 0) {
           return jsonResponse({ success: false, error: 'Invalid file size' }, 400, corsHeaders);
         }
 
+        // 1. File size check (100 MiB limit)
         if (sizeBytes > maxFileSizeBytes) {
           return jsonResponse({
             success: false,
-            error: `File exceeds maximum allowed size of ${Math.round(maxFileSizeBytes / (1024 * 1024))}MB`
+            error: `File exceeds maximum allowed size of ${Math.round(maxFileSizeBytes / (1024 * 1024))} MiB`
           }, 400, corsHeaders);
         }
 
-        if (room.total_size_bytes + sizeBytes > maxRoomSizeBytes) {
+        // 2. Room file count check: both uploaded and actively pending files count toward the 20 files limit
+        const activeFilesCountResult = await env.DB.prepare(
+          `SELECT COUNT(*) as count FROM files WHERE room_id = ? AND status IN ('uploaded', 'pending')`
+        ).bind(roomId).first<{ count: number }>();
+
+        const currentActiveFilesCount = activeFilesCountResult?.count || 0;
+        if (currentActiveFilesCount >= maxFilesPerRoom) {
           return jsonResponse({
             success: false,
-            error: `Upload would exceed remaining room capacity (${Math.round((maxRoomSizeBytes - room.total_size_bytes) / (1024 * 1024))}MB remaining)`
+            error: `Room has reached the maximum limit of ${maxFilesPerRoom} files`
+          }, 400, corsHeaders);
+        }
+
+        // 3. Room capacity check with concurrency protection:
+        // Sum total size of uploaded files PLUS in-flight pending files
+        const inFlightSizeResult = await env.DB.prepare(
+          `SELECT TOTAL(size_bytes) as total_allocated FROM files WHERE room_id = ? AND status IN ('uploaded', 'pending')`
+        ).bind(roomId).first<{ total_allocated: number }>();
+
+        const totalAllocatedBytes = inFlightSizeResult?.total_allocated || 0;
+        if (totalAllocatedBytes + sizeBytes > maxRoomSizeBytes) {
+          const remainingBytes = Math.max(0, maxRoomSizeBytes - totalAllocatedBytes);
+          return jsonResponse({
+            success: false,
+            error: `Upload would exceed remaining room capacity (${Math.round(remainingBytes / (1024 * 1024))} MiB remaining)`
           }, 400, corsHeaders);
         }
 
         const fileId = crypto.randomUUID();
-        // Storage key isolates files by room: "rooms/{roomId}/{fileId}/{safeFilename}"
         const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
         const storageKey = `rooms/${roomId}/${fileId}_${safeName}`;
 
@@ -322,25 +377,86 @@ export default {
             return jsonResponse({ success: false, error: 'Missing request body' }, 400, corsHeaders);
           }
 
-          // Stream body directly into R2
-          await env.BUCKET.put(file.storage_key, request.body, {
-            httpMetadata: {
-              contentType: file.content_type
-            },
-            customMetadata: {
-              roomId,
-              filename: file.filename
+          // Stream body directly into R2 while counting actual received bytes
+          // TransformStream allows metering chunks as they stream through to R2
+          let actualReceivedBytes = 0;
+          let limitExceeded = false;
+
+          const { readable, writable } = new TransformStream({
+            transform(chunk, controller) {
+              actualReceivedBytes += chunk.byteLength || chunk.length || 0;
+              if (actualReceivedBytes > maxFileSizeBytes) {
+                limitExceeded = true;
+                controller.error(new Error(`Payload exceeded maximum file size of ${maxFileSizeBytes} bytes`));
+                return;
+              }
+              controller.enqueue(chunk);
             }
           });
 
-          // Mark file as uploaded and update room total size
+          try {
+            // Pipe request.body through metering stream into R2
+            const pipePromise = request.body.pipeTo(writable);
+            const putPromise = env.BUCKET.put(file.storage_key, readable, {
+              httpMetadata: {
+                contentType: file.content_type
+              },
+              customMetadata: {
+                roomId,
+                filename: file.filename
+              }
+            });
+
+            await Promise.all([pipePromise, putPromise]);
+          } catch (uploadErr: any) {
+            // Interrupted or failed upload: clean up R2 object and delete incomplete file record
+            try {
+              await env.BUCKET.delete(file.storage_key);
+            } catch {}
+            await env.DB.prepare(`DELETE FROM files WHERE id = ?`).bind(fileId).run();
+
+            if (limitExceeded) {
+              return jsonResponse({
+                success: false,
+                error: `Uploaded file size exceeded the maximum limit of ${Math.round(maxFileSizeBytes / (1024 * 1024))} MiB`
+              }, 400, corsHeaders);
+            }
+
+            return jsonResponse({
+              success: false,
+              error: `Upload streaming interrupted: ${uploadErr.message || 'unknown error'}`
+            }, 500, corsHeaders);
+          }
+
+          // If actual received bytes mismatch significantly or exceed max room capacity
+          const finalSize = actualReceivedBytes > 0 ? actualReceivedBytes : file.size_bytes;
+
+          // Double check room capacity with final actual size
+          const currentTotalResult = await env.DB.prepare(
+            `SELECT TOTAL(size_bytes) as total FROM files WHERE room_id = ? AND status = 'uploaded'`
+          ).bind(roomId).first<{ total: number }>();
+
+          const currentTotal = currentTotalResult?.total || 0;
+          if (currentTotal + finalSize > maxRoomSizeBytes) {
+            // Over room quota! Clean up R2 and remove pending file
+            try {
+              await env.BUCKET.delete(file.storage_key);
+            } catch {}
+            await env.DB.prepare(`DELETE FROM files WHERE id = ?`).bind(fileId).run();
+            return jsonResponse({
+              success: false,
+              error: `Upload would exceed total room capacity of ${Math.round(maxRoomSizeBytes / (1024 * 1024))} MiB`
+            }, 400, corsHeaders);
+          }
+
+          // Mark file as uploaded and atomically update room total size
           await env.DB.batch([
             env.DB.prepare(
-              `UPDATE files SET status = 'uploaded', uploaded_at = ? WHERE id = ?`
-            ).bind(now, fileId),
+              `UPDATE files SET status = 'uploaded', size_bytes = ?, uploaded_at = ? WHERE id = ?`
+            ).bind(finalSize, now, fileId),
             env.DB.prepare(
               `UPDATE rooms SET total_size_bytes = total_size_bytes + ? WHERE id = ?`
-            ).bind(file.size_bytes, roomId)
+            ).bind(finalSize, roomId)
           ]);
 
           return jsonResponse({ success: true, message: 'File uploaded successfully' }, 200, corsHeaders);
@@ -357,14 +473,21 @@ export default {
             return jsonResponse({ success: false, error: 'Missing part body' }, 400, corsHeaders);
           }
 
-          const multipart = env.BUCKET.resumeMultipartUpload(file.storage_key, file.upload_id);
-          const uploadedPart = await multipart.uploadPart(partNumber, request.body);
+          try {
+            const multipart = env.BUCKET.resumeMultipartUpload(file.storage_key, file.upload_id);
+            const uploadedPart = await multipart.uploadPart(partNumber, request.body);
 
-          return jsonResponse({
-            success: true,
-            partNumber,
-            etag: uploadedPart.etag
-          }, 200, corsHeaders);
+            return jsonResponse({
+              success: true,
+              partNumber,
+              etag: uploadedPart.etag
+            }, 200, corsHeaders);
+          } catch (partErr: any) {
+            return jsonResponse({
+              success: false,
+              error: `Failed to upload part ${partNumber}: ${partErr.message}`
+            }, 500, corsHeaders);
+          }
         }
 
         // Complete multipart upload: POST /api/rooms/:roomId/files/:fileId/complete
@@ -378,29 +501,58 @@ export default {
             return jsonResponse({ success: false, error: 'Missing parts array' }, 400, corsHeaders);
           }
 
-          const multipart = env.BUCKET.resumeMultipartUpload(file.storage_key, file.upload_id);
-          await multipart.complete(body.parts);
+          try {
+            const multipart = env.BUCKET.resumeMultipartUpload(file.storage_key, file.upload_id);
+            const completedObj = await multipart.complete(body.parts);
 
-          await env.DB.batch([
-            env.DB.prepare(
-              `UPDATE files SET status = 'uploaded', uploaded_at = ? WHERE id = ?`
-            ).bind(now, fileId),
-            env.DB.prepare(
-              `UPDATE rooms SET total_size_bytes = total_size_bytes + ? WHERE id = ?`
-            ).bind(file.size_bytes, roomId)
-          ]);
+            const finalSize = completedObj.size || file.size_bytes;
 
-          return jsonResponse({ success: true, message: 'Multipart file completed successfully' }, 200, corsHeaders);
+            // Check room capacity limit before finalizing
+            const currentTotalResult = await env.DB.prepare(
+              `SELECT TOTAL(size_bytes) as total FROM files WHERE room_id = ? AND status = 'uploaded'`
+            ).bind(roomId).first<{ total: number }>();
+
+            const currentTotal = currentTotalResult?.total || 0;
+            if (currentTotal + finalSize > maxRoomSizeBytes) {
+              await env.BUCKET.delete(file.storage_key);
+              await env.DB.prepare(`DELETE FROM files WHERE id = ?`).bind(fileId).run();
+              return jsonResponse({
+                success: false,
+                error: `Upload would exceed total room capacity of ${Math.round(maxRoomSizeBytes / (1024 * 1024))} MiB`
+              }, 400, corsHeaders);
+            }
+
+            await env.DB.batch([
+              env.DB.prepare(
+                `UPDATE files SET status = 'uploaded', size_bytes = ?, uploaded_at = ? WHERE id = ?`
+              ).bind(finalSize, now, fileId),
+              env.DB.prepare(
+                `UPDATE rooms SET total_size_bytes = total_size_bytes + ? WHERE id = ?`
+              ).bind(finalSize, roomId)
+            ]);
+
+            return jsonResponse({ success: true, message: 'Multipart file completed successfully' }, 200, corsHeaders);
+          } catch (completeErr: any) {
+            return jsonResponse({
+              success: false,
+              error: `Failed to finalize multipart upload: ${completeErr.message}`
+            }, 500, corsHeaders);
+          }
         }
 
         // Abort multipart upload: POST /api/rooms/:roomId/files/:fileId/abort
         if (action === '/abort' && request.method === 'POST') {
           if (file.upload_id) {
-            const multipart = env.BUCKET.resumeMultipartUpload(file.storage_key, file.upload_id);
-            await multipart.abort();
+            try {
+              const multipart = env.BUCKET.resumeMultipartUpload(file.storage_key, file.upload_id);
+              await multipart.abort();
+            } catch {}
           }
+          try {
+            await env.BUCKET.delete(file.storage_key);
+          } catch {}
           await env.DB.prepare(`DELETE FROM files WHERE id = ?`).bind(fileId).run();
-          return jsonResponse({ success: true, message: 'Upload aborted' }, 200, corsHeaders);
+          return jsonResponse({ success: true, message: 'Upload aborted and cleaned up' }, 200, corsHeaders);
         }
 
         // ==========================================

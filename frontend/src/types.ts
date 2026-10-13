@@ -6,6 +6,8 @@ export interface RoomInfo {
   totalSizeBytes: number;
   maxFileSizeBytes: number;
   maxRoomSizeBytes: number;
+  maxFilesPerRoom: number;
+  maxConcurrentUploads: number;
   files: RoomFile[];
 }
 

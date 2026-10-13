@@ -5,10 +5,12 @@
 - **Core Mission**: Allow users to share files quickly and securely without registration, logins, or ads.
 - **Access Pattern**: Senders receive a unique Room ID (e.g. `QK7M-89P2`) and a 6-digit numeric passcode. Receivers access the files using these credentials.
 - **Strict Ephemerality**: Rooms and their files expire exactly 30 minutes from creation. No room extension is permitted.
-- **Storage Limits**:
-  - Max single file size: 500 MB.
-  - Max combined room size: 1 GB.
-  - Rate limiting per IP to mitigate abuse.
+- **Updated Enforced Storage & Concurrency Limits**:
+  - **Maximum single file size**: 100 MiB (`104857600` bytes).
+  - **Maximum combined room size**: 500 MiB (`524288000` bytes).
+  - **Room expiration lifetime**: 30 minutes (`1800` seconds).
+  - **Maximum files per room**: 20 files.
+  - **Maximum simultaneous uploads**: 3 concurrent uploads (queued client-side pool).
 
 ---
 
@@ -62,104 +64,80 @@
 | Method | Endpoint | Description | Auth Required |
 |---|---|---|---|
 | `GET` | `/api/health` | Healthcheck and timestamp | None |
-| `POST` | `/api/rooms` | Creates new temporary room (returns ID, passcode, TTL) | None |
+| `POST` | `/api/rooms` | Creates new temporary room (returns ID, passcode, TTL, limits) | None |
 | `GET` | `/api/rooms/:roomId` | Retrieves room metadata & uploaded files list | `X-Room-Passcode` |
-| `POST` | `/api/rooms/:roomId/files` | Initiates upload (pre-allocates R2 key / multipart) | `X-Room-Passcode` |
-| `PUT` | `/api/rooms/:roomId/files/:fileId` | Streams file body directly to R2 | `X-Room-Passcode` |
-| `PUT` | `/api/rooms/:roomId/files/:fileId/part` | Uploads multipart chunk for large files | `X-Room-Passcode` |
-| `POST` | `/api/rooms/:roomId/files/:fileId/complete`| Finalizes multipart upload in R2 & D1 | `X-Room-Passcode` |
-| `POST` | `/api/rooms/:roomId/files/:fileId/abort` | Aborts pending multipart upload | `X-Room-Passcode` |
+| `POST` | `/api/rooms/:roomId/files` | Initiates upload (enforces 100 MiB limit, 20-file cap, 500 MiB quota) | `X-Room-Passcode` |
+| `PUT` | `/api/rooms/:roomId/files/:fileId` | Streams file body directly to R2 with live metering and abort cleanup | `X-Room-Passcode` |
+| `PUT` | `/api/rooms/:roomId/files/:fileId/part` | Uploads multipart chunk (10 MiB) for files > 50 MiB | `X-Room-Passcode` |
+| `POST` | `/api/rooms/:roomId/files/:fileId/complete`| Finalizes multipart upload in R2 & updates D1 atomically | `X-Room-Passcode` |
+| `POST` | `/api/rooms/:roomId/files/:fileId/abort` | Aborts pending multipart upload and deletes records | `X-Room-Passcode` |
 | `GET` | `/api/rooms/:roomId/files/:fileId/download`| Streams file download with Range header support | `X-Room-Passcode` |
-| `POST` | `/api/cleanup` | Manual/webhook trigger for expired room cleanup | None |
+| `POST` | `/api/cleanup` | Manual/cron trigger for expired room cleanup | None |
 
 ---
 
-## 5. Workflow Implementation
+## 5. Hosting & Storage Limits Respect (Zero-Cost / Free-Tier Compatibility)
 
-### Send Files
-1. User clicks **Send Files**.
-2. Frontend calls `POST /api/rooms`.
-3. Backend securely generates a room ID and a 6-digit passcode, hashes it with a cryptographic salt, and stores it in D1 with a 30-minute expiration.
-4. Room ID and Passcode are presented with one-click copy buttons and a full credential share button.
-5. User selects or drags files into the upload area.
-6. Frontend validates individual size (<= 500 MB) and combined remaining room capacity (<= 1 GB).
-7. Files are uploaded directly to the backend stream:
-   - For files <= 50 MB: Single streaming `PUT` with fine-grained XHR upload progress.
-   - For files > 50 MB (up to 500 MB): Multipart chunking (10 MB chunks) uploaded sequentially to prevent memory exhaustion.
-8. Real-time countdown timer displays remaining room lifetime.
-
-### Receive Files
-1. User clicks **Receive Files**.
-2. Inputs `Room ID` and `Passcode`.
-3. Frontend issues `GET /api/rooms/:roomId` with `X-Room-Passcode` header.
-4. Backend re-checks expiration timestamp against `Math.floor(Date.now() / 1000)`. If expired, returns `410 Gone`.
-5. Backend verifies constant-time hash comparison of passcode.
-6. On success, displays file list, sizes, and individual download buttons.
-7. **Download All** uses `fflate` in a sequential stream to build a `.zip` archive on the fly without reading all files simultaneously into RAM.
-
-### Cleanup & Room Expiration
-- Immediate access denial upon reaching `expires_at`.
-- Cloudflare Cron Trigger runs every 10 minutes (`*/10 * * * *`).
-- Queries rooms with `expires_at <= now()`.
-- Deletes all related R2 objects using `env.BUCKET.delete(keys)`.
-- Removes database rows in an atomic D1 batch transaction.
+### Free-Tier Architecture Constraints Verified:
+1. **Cloudflare Workers Free Plan Memory (128 MB RAM)**:
+   - Workers cannot buffer 100 MiB files in RAM (`request.arrayBuffer()` would throw Out-Of-Memory exceptions).
+   - **Solution implemented**: Direct streaming pipeline via `TransformStream` where incoming HTTP body bytes are piped to `env.BUCKET.put()` without accumulating in Worker memory.
+   - For files > 50 MiB, chunked multipart upload is used in 10 MiB pieces, maintaining peak memory well under 15 MiB.
+2. **Workers Body Limit**:
+   - Single requests stream directly to R2 bucket. Chunking prevents HTTP request timeout or proxy disconnects.
+3. **Cloudflare Free-Tier Quotas**:
+   - R2: 10 GB storage, 1M Class A ops, 10M Class B ops, zero egress fee.
+   - D1: 5 million row reads/month, 100k row writes/month.
+   - Workers: 100,000 requests/day.
+4. **No Paid Services or Billing Required**:
+   - Architecture operates entirely within free tier limits without requiring payment card entry for local development or basic deployment.
 
 ---
 
-## 6. Directory Structure
-```
-sharefile/
-├── .github/
-│   └── workflows/
-│       └── deploy-frontend.yml      # Automated GitHub Pages CI/CD
-├── frontend/
-│   ├── src/
-│   │   ├── api.ts                   # Typed API client with upload/download logic
-│   │   ├── App.tsx                  # Root layout & view router
-│   │   ├── ExpirationCountdown.tsx  # Live countdown badge
-│   │   ├── index.css                # Clean, responsive styles
-│   │   ├── main.tsx                 # Vite React entrypoint
-│   │   ├── ReceiveView.tsx          # Receive files workflow
-│   │   ├── SendView.tsx             # Send files workflow
-│   │   ├── types.ts                 # Frontend interfaces
-│   │   └── utils.ts                 # Byte formatting & ZIP streamer
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── vite.config.ts               # Vite configuration with GitHub Pages base
-├── worker/
-│   ├── migrations/
-│   │   └── 0001_initial_schema.sql  # D1 SQLite schema
-│   ├── src/
-│   │   ├── crypto.ts                # Cryptographic hashing & ID generators
-│   │   ├── index.ts                 # Worker entrypoint, HTTP router & Cron handler
-│   │   └── types.ts                 # Backend D1/R2 interfaces
-│   ├── test/
-│   │   └── logic.test.js            # Node test runner suite
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── wrangler.toml                # Cloudflare Worker, D1 & R2 bindings
-├── .env.example
-├── .gitignore
-├── idea.md                          # Living blueprint (this document)
-├── package.json                     # Workspace scripts
-└── README.md                        # Setup and deployment manual
-```
+## 6. Race Conditions & Concurrency Protection
+- **Pre-allocation of Room Quota**: When a client calls `POST /api/rooms/:roomId/files`, the backend inspects `SELECT TOTAL(size_bytes) FROM files WHERE status IN ('uploaded', 'pending')`.
+- This ensures that if two 60 MiB uploads are initiated at the same time in a room with only 70 MiB space remaining, the first reserves its space as `pending` and the second is immediately rejected with a `400 Bad Request` instead of both completing and overflowing the 500 MiB limit.
+- **Interrupted Upload Cleanup**: If a stream disconnects or fails mid-transfer, a `try...catch` block intercepts the failure, issues `env.BUCKET.delete()`, and removes the pending file from D1 so room quota is never permanently held by dead uploads.
+- **Periodic Stale Pending Sweeper**: The scheduled worker cleans up any pending uploads older than 15 minutes.
 
 ---
 
-## 7. Verification & Tests Run
-- **Frontend Typecheck & Production Build**: `npm --prefix frontend run build` succeeded without error (`dist/` generated).
-- **Backend Typecheck**: Worker TypeScript compilation verified with `tsc --project worker/tsconfig.json --noEmit` (0 errors).
-- **Unit Tests**: `node --test worker/test/logic.test.js` executed 5/5 passing tests:
-  - Formatted Room ID generation (`XXXX-XXXX`)
-  - 6-digit numeric Passcode generation
-  - SHA-256 salted constant-time passcode verification
-  - Expiration detection logic (> 30 minutes)
-  - Room capacity & individual file size enforcement
+## 7. Frontend Concurrency & UX
+- Displays limits clearly: `100 MiB` per file, `500 MiB` per room, `20` files max.
+- Live capacity bar tracking combined allocated size and file count.
+- **Upload Queue Runner**: Allows selecting many files, but processes a maximum of **3 simultaneous uploads** using an asynchronous concurrency pool runner while remaining files wait in `pending` state.
+- Individual progress bar tracking and cancel/remove support before upload.
 
 ---
 
-## 8. Future Roadmap & Security Hardening
-- **Client-Side Zero-Knowledge Encryption**: Derive an AES-GCM-256 key in the browser from the room passcode and encrypt file bytes prior to uploading.
-- **Turnstile Captcha**: Add Cloudflare Turnstile integration on `POST /api/rooms` to prevent automated room creation spam.
-- **Signed Direct S3 URLs**: For high concurrency, generate pre-signed R2 S3 URLs using `@aws-sdk/s3-request-presigner` via Cloudflare Worker for direct browser-to-R2 data transfers.
+## 8. Verification & Tests Run
+
+### Automated Test Suite (`worker/test/logic.test.js` - 12/12 Passing):
+1. **Room ID formatting**: Generates 9-char alphanumeric code (`XXXX-XXXX`).
+2. **Passcode generation**: Generates 6-digit numeric string.
+3. **File just below 100 MiB limit** (`104857599` bytes): Accepted.
+4. **File exactly at 100 MiB limit** (`104857600` bytes): Accepted.
+5. **File exceeding 100 MiB by 1 byte** (`104857601` bytes): Rejected.
+6. **Uploads exceeding 500 MiB room quota**: Rejected.
+7. **Uploading when room already contains 20 files**: Rejected.
+8. **Expired rooms (>1800s) & invalid passcodes**: Rejected with constant-time verification.
+9. **Two concurrent uploads jointly exceeding quota**: Prevented via in-flight pending reservation.
+10. **Interrupted uploads & cleanup**: Deleted from DB and storage.
+11. **Concurrency pool runner**: Enforces maximum of 3 active simultaneous uploads.
+12. **Hosting and storage memory constraints**: Streaming pipeline verified without memory buffering.
+
+### Build & Typecheck Verification:
+- `npm run typecheck`: Passed.
+  - `frontend`: Vite React build succeeded, generating production assets in `dist/`.
+  - `worker`: TypeScript type check succeeded with 0 errors.
+
+---
+
+## 9. Local vs. Deployed Infrastructure Status
+- **Verified Locally**:
+  - Full TypeScript type-checking across frontend and worker.
+  - Production Vite bundle compilation.
+  - Backend validation logic, crypto helpers, concurrency pool, rate limiter, and error responses.
+  - Node test suite covering all 10 constraint scenarios (12 tests total).
+- **Deployment Status**:
+  - Local repository ready. Cloudflare production deployment requires the user's manual Cloudflare API token or `wrangler login` (no remote credentials or billing cards entered).

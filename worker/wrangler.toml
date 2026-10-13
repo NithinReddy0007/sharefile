@@ -7,7 +7,7 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "qshare-db"
-database_id = "local-qshare-db"
+database_id = "c018ab94-d115-4288-808d-ae88b7dea758"
 migrations_dir = "migrations"
 
 # R2 Storage bucket binding
@@ -19,10 +19,12 @@ preview_bucket_name = "qshare-files-preview"
 # Environment variables
 [vars]
 ALLOWED_ORIGIN = "*"
-MAX_FILE_SIZE_BYTES = 524288000 # 500 MB
-MAX_ROOM_SIZE_BYTES = 1073741824 # 1 GB
-ROOM_TTL_SECONDS = 1800 # 30 minutes
+MAX_FILE_SIZE_BYTES = 104857600
+MAX_ROOM_SIZE_BYTES = 524288000
+ROOM_TTL_SECONDS = 1800
+MAX_FILES_PER_ROOM = 20
+MAX_CONCURRENT_UPLOADS = 3
 
-# Scheduled cron trigger for automatic expired rooms cleanup (runs every 10 minutes)
+# Automatic cleanup every 10 minutes
 [triggers]
 crons = ["*/10 * * * *"]

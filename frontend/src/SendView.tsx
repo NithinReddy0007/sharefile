@@ -19,6 +19,7 @@ export const SendView: React.FC<SendViewProps> = ({ onBack }) => {
   const [queue, setQueue] = useState<UploadItem[]>([]);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [isExpired, setIsExpired] = useState<boolean>(false);
+  const [isUploading, setIsUploading] = useState<boolean>(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -39,6 +40,8 @@ export const SendView: React.FC<SendViewProps> = ({ onBack }) => {
             totalSizeBytes: 0,
             maxFileSizeBytes: data.maxFileSizeBytes,
             maxRoomSizeBytes: data.maxRoomSizeBytes,
+            maxFilesPerRoom: data.maxFilesPerRoom,
+            maxConcurrentUploads: data.maxConcurrentUploads,
             files: []
           });
         }
@@ -77,13 +80,20 @@ export const SendView: React.FC<SendViewProps> = ({ onBack }) => {
 
     setError(null);
     const newItems: UploadItem[] = [];
-    const maxFileSize = room.maxFileSizeBytes;
-    const maxRoomSize = room.maxRoomSizeBytes;
+    const maxFileSize = room.maxFileSizeBytes || 104857600; // 100 MiB
+    const maxRoomSize = room.maxRoomSizeBytes || 524288000; // 500 MiB
+    const maxFiles = room.maxFilesPerRoom || 20;
 
-    let currentTotalSize = room.totalSizeBytes + queue.reduce((acc, q) => acc + q.file.size, 0);
+    const existingFileCount = room.files.length + queue.filter((q) => q.status !== 'error').length;
+    let currentTotalSize = room.totalSizeBytes + queue.filter((q) => q.status !== 'error').reduce((acc, q) => acc + q.file.size, 0);
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
+
+      if (existingFileCount + newItems.length >= maxFiles) {
+        setError(`Cannot add "${file.name}". Room has reached the maximum limit of ${maxFiles} files.`);
+        break;
+      }
 
       if (file.size > maxFileSize) {
         setError(`File "${file.name}" exceeds maximum allowed individual size of ${formatBytes(maxFileSize)}.`);
@@ -91,7 +101,7 @@ export const SendView: React.FC<SendViewProps> = ({ onBack }) => {
       }
 
       if (currentTotalSize + file.size > maxRoomSize) {
-        setError(`Adding "${file.name}" would exceed the 1 GB room capacity.`);
+        setError(`Adding "${file.name}" would exceed the 500 MiB room capacity.`);
         continue;
       }
 
@@ -113,67 +123,119 @@ export const SendView: React.FC<SendViewProps> = ({ onBack }) => {
     setQueue((prev) => prev.filter((item) => item.id !== id));
   };
 
+  /**
+   * Upload worker that enforces MAX_CONCURRENT_UPLOADS = 3
+   */
   const startUpload = async () => {
-    if (!room || !room.passcode || isExpired) return;
+    if (!room || !room.passcode || isExpired || isUploading) return;
 
-    const pendingItems = queue.filter((item) => item.status === 'pending');
-    if (pendingItems.length === 0) return;
+    setIsUploading(true);
+    const maxConcurrent = room.maxConcurrentUploads || 3;
 
-    for (const item of pendingItems) {
-      // update status to uploading
-      setQueue((prev) =>
-        prev.map((i) => (i.id === item.id ? { ...i, status: 'uploading', progress: 0 } : i))
-      );
+    // Concurrency pool runner
+    await new Promise<void>((resolveAll) => {
+      let isDone = false;
 
-      try {
-        await uploadFileToRoom(room.roomId, room.passcode, item.file, (_, __, percent) => {
+      const processNext = () => {
+        if (isDone) return;
+
+        setQueue((currentQueue) => {
+          const pendingItems = currentQueue.filter((item) => item.status === 'pending');
+          const uploadingItems = currentQueue.filter((item) => item.status === 'uploading');
+
+          if (pendingItems.length === 0 && uploadingItems.length === 0) {
+            isDone = true;
+            resolveAll();
+            return currentQueue;
+          }
+
+          const availableSlots = maxConcurrent - uploadingItems.length;
+          if (availableSlots <= 0 || pendingItems.length === 0) {
+            return currentQueue;
+          }
+
+          const toStart = pendingItems.slice(0, availableSlots);
+
+          // Mark toStart as uploading
+          const nextQueue = currentQueue.map((item) => {
+            if (toStart.some((s) => s.id === item.id)) {
+              return { ...item, status: 'uploading' as const, progress: 0 };
+            }
+            return item;
+          });
+
+          // Kick off the uploads asynchronously
+          for (const item of toStart) {
+            uploadSingleItem(item).finally(() => {
+              processNext();
+            });
+          }
+
+          return nextQueue;
+        });
+      };
+
+      const uploadSingleItem = async (item: UploadItem) => {
+        try {
+          await uploadFileToRoom(room.roomId, room.passcode!, item.file, (_, __, percent) => {
+            setQueue((prev) =>
+              prev.map((i) => (i.id === item.id ? { ...i, progress: percent } : i))
+            );
+          });
+
+          // Mark as completed
           setQueue((prev) =>
-            prev.map((i) => (i.id === item.id ? { ...i, progress: percent } : i))
+            prev.map((i) => (i.id === item.id ? { ...i, status: 'completed', progress: 100 } : i))
           );
-        });
 
-        // mark as completed and update room total size
-        setQueue((prev) =>
-          prev.map((i) => (i.id === item.id ? { ...i, status: 'completed', progress: 100 } : i))
-        );
+          // Update room's local files and total size
+          setRoom((prev) => {
+            if (!prev) return null;
+            return {
+              ...prev,
+              totalSizeBytes: prev.totalSizeBytes + item.file.size,
+              files: [
+                ...prev.files,
+                {
+                  id: item.id,
+                  filename: item.file.name,
+                  size_bytes: item.file.size,
+                  content_type: item.file.type,
+                  status: 'uploaded',
+                  uploaded_at: Math.floor(Date.now() / 1000),
+                  created_at: Math.floor(Date.now() / 1000)
+                }
+              ]
+            };
+          });
+        } catch (err: any) {
+          setQueue((prev) =>
+            prev.map((i) =>
+              i.id === item.id
+                ? { ...i, status: 'error', errorMessage: err.message || 'Upload failed' }
+                : i
+            )
+          );
+        }
+      };
 
-        setRoom((prev) => {
-          if (!prev) return null;
-          return {
-            ...prev,
-            totalSizeBytes: prev.totalSizeBytes + item.file.size,
-            files: [
-              ...prev.files,
-              {
-                id: item.id,
-                filename: item.file.name,
-                size_bytes: item.file.size,
-                content_type: item.file.type,
-                status: 'uploaded',
-                uploaded_at: Math.floor(Date.now() / 1000),
-                created_at: Math.floor(Date.now() / 1000)
-              }
-            ]
-          };
-        });
-      } catch (err: any) {
-        setQueue((prev) =>
-          prev.map((i) =>
-            i.id === item.id
-              ? { ...i, status: 'error', errorMessage: err.message || 'Upload failed' }
-              : i
-          )
-        );
-      }
-    }
+      processNext();
+    });
+
+    setIsUploading(false);
   };
 
-  const uploadedSize = (room?.totalSizeBytes || 0);
-  const remainingSize = Math.max(0, (room?.maxRoomSizeBytes || 1073741824) - uploadedSize);
-  const capacityPercent = Math.min(
-    100,
-    Math.round((uploadedSize / (room?.maxRoomSizeBytes || 1073741824)) * 100)
-  );
+  const totalCapacity = room?.maxRoomSizeBytes || 524288000;
+  const maxPerFile = room?.maxFileSizeBytes || 104857600;
+  const maxFiles = room?.maxFilesPerRoom || 20;
+
+  const uploadedSize = room?.totalSizeBytes || 0;
+  const queuedSize = queue.filter((q) => q.status === 'pending' || q.status === 'uploading').reduce((acc, q) => acc + q.file.size, 0);
+  const usedSize = uploadedSize + queuedSize;
+  const remainingSize = Math.max(0, totalCapacity - usedSize);
+  const capacityPercent = Math.min(100, Math.round((usedSize / totalCapacity) * 100));
+
+  const totalFilesCount = (room?.files.length || 0) + queue.filter((q) => q.status !== 'error').length;
 
   return (
     <div className="card">
@@ -257,8 +319,8 @@ export const SendView: React.FC<SendViewProps> = ({ onBack }) => {
           {/* Capacity Bar */}
           <div className="capacity-container">
             <div className="capacity-header">
-              <span>Uploaded: {formatBytes(uploadedSize)}</span>
-              <span>Remaining: {formatBytes(remainingSize)} / 1 GB</span>
+              <span>Allocated: {formatBytes(usedSize)} ({totalFilesCount}/{maxFiles} files)</span>
+              <span>Remaining: {formatBytes(remainingSize)} / {formatBytes(totalCapacity)}</span>
             </div>
             <div className="capacity-bar-track">
               <div className="capacity-bar-fill" style={{ width: `${capacityPercent}%` }} />
@@ -286,11 +348,13 @@ export const SendView: React.FC<SendViewProps> = ({ onBack }) => {
               multiple
               style={{ display: 'none' }}
               onChange={(e) => handleFilesAdded(e.target.files)}
-              disabled={isExpired}
+              disabled={isExpired || totalFilesCount >= maxFiles}
             />
             <Upload className="dropzone-icon" />
             <div className="dropzone-title">Drag & drop files here, or click to browse</div>
-            <div className="dropzone-subtitle">Up to 500 MB per file • Max 1 GB per room</div>
+            <div className="dropzone-subtitle">
+              Max {formatBytes(maxPerFile)} per file • Max {formatBytes(totalCapacity)} per room • Up to {maxFiles} files
+            </div>
           </div>
 
           {/* Queue List */}
@@ -333,6 +397,7 @@ export const SendView: React.FC<SendViewProps> = ({ onBack }) => {
                           className="btn-icon btn-danger"
                           title="Remove from queue"
                           onClick={() => removeQueueItem(item.id)}
+                          disabled={isUploading}
                         >
                           <Trash2 size={16} />
                         </button>
@@ -347,9 +412,9 @@ export const SendView: React.FC<SendViewProps> = ({ onBack }) => {
                   className="btn btn-primary"
                   style={{ width: '100%' }}
                   onClick={startUpload}
-                  disabled={isExpired}
+                  disabled={isExpired || isUploading}
                 >
-                  Upload Queued Files
+                  {isUploading ? 'Uploading (up to 3 simultaneous)...' : 'Upload Queued Files'}
                 </button>
               )}
             </div>
