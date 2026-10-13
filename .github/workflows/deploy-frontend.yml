@@ -8,8 +8,6 @@ on:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 concurrency:
   group: "pages"
@@ -38,10 +36,9 @@ jobs:
           VITE_BASE_PATH: /sharefile/
           VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
 
-      - name: Copy index.html to 404.html for SPA routing
+      - name: Create 404.html for client-side routing
         run: cp frontend/dist/index.html frontend/dist/404.html
 
-      # 1. Deploy to gh-pages branch (works immediately out of the box with standard branch deployment)
       - name: Deploy to gh-pages branch
         uses: peaceiris/actions-gh-pages@v4
         with:
@@ -49,20 +46,3 @@ jobs:
           publish_dir: ./frontend/dist
           publish_branch: gh-pages
           force_orphan: true
-
-      # 2. Also upload artifact and deploy directly if repository is set to GitHub Actions source
-      - name: Setup Pages
-        id: setup_pages
-        continue-on-error: true
-        uses: actions/configure-pages@v4
-
-      - name: Upload artifact
-        if: steps.setup_pages.outcome == 'success'
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: frontend/dist
-
-      - name: Deploy to GitHub Pages
-        if: steps.setup_pages.outcome == 'success'
-        id: deployment
-        uses: actions/deploy-pages@v4
