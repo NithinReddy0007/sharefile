@@ -21,8 +21,9 @@
 - **Styling**: Plain CSS (clean, responsive, subtle borders, muted blue accents, no gradients or heavy animations).
 - **Icons**: `lucide-react`.
 - **ZIP Bundler**: `fflate` for client-side streaming archive creation on "Download All".
-- **Hosting**: GitHub Pages via GitHub Actions (`.github/workflows/deploy-frontend.yml`).
-- **Base Path**: Configurable via `VITE_BASE_PATH` (defaults to `/sharefile/` on GitHub Actions and `/` on local development).
+- **Hosting**: GitHub Pages via official GitHub Actions (`.github/workflows/deploy.yml`).
+- **Base Path**: Hardcoded in Vite configuration as `base: '/sharefile/'` for consistent asset resolution (`/sharefile/assets/...`).
+- **Artifact**: Strictly uploads `frontend/dist/` so `index.html` resides at the root of the site, preventing README fallback.
 - **API URL**: Configurable via `VITE_API_BASE_URL` (defaults to `http://127.0.0.1:8787`).
 
 ### Backend & Storage
@@ -140,4 +141,6 @@
   - Backend validation logic, crypto helpers, concurrency pool, rate limiter, and error responses.
   - Node test suite covering all 10 constraint scenarios (12 tests total).
 - **Deployment Status**:
-  - Local repository ready. Cloudflare production deployment requires the user's manual Cloudflare API token or `wrangler login` (no remote credentials or billing cards entered).
+  - GitHub Pages Deployment: Managed via `.github/workflows/deploy.yml` with official `actions/upload-pages-artifact@v3` and `actions/deploy-pages@v4`.
+  - Publishing Source requirement: GitHub Repository **Settings → Pages → Build and deployment → Source** must be set to **GitHub Actions**.
+  - Worker API: Separately deployable Cloudflare Worker with D1 database and R2 bucket.

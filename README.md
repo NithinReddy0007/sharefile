@@ -135,22 +135,22 @@ Note your deployed Worker URL (e.g., `https://qshare-api.<your-subdomain>.worker
 
 ## GitHub Pages Deployment
 
-The repository includes a ready GitHub Actions workflow at `.github/workflows/deploy-frontend.yml`.
+The repository includes the official GitHub Pages deployment workflow at `.github/workflows/deploy.yml`.
 
-### 1. Configure GitHub Repository
+### 1. Configure GitHub Repository Settings
 1. Go to your repository on GitHub: `https://github.com/NithinReddy0007/sharefile`.
 2. Navigate to **Settings** > **Pages**.
-3. Under **Build and deployment** > **Source**, choose:
-   - **Deploy from a branch**
-   - Branch: `gh-pages` / Folder: `/ (root)`
-   - Click **Save**.
+3. Under **Build and deployment** > **Source**, select **GitHub Actions** (do NOT choose "Deploy from a branch").
 4. (Optional) In **Settings** > **Secrets and variables** > **Actions** > **Variables**, configure:
    - Name: `VITE_API_BASE_URL`
    - Value: `https://qshare-api.<your-subdomain>.workers.dev` (your deployed Worker API URL)
 
-### 2. Trigger Deployment
-Any push to the `main` branch automatically triggers `.github/workflows/deploy-frontend.yml`, which compiles the React frontend with Vite and deploys the production build to the `gh-pages` branch.
-GitHub Pages serves the live app at: `https://nithinreddy0007.github.io/sharefile/`.
+### 2. Automatic Deployment
+Every push to the `main` branch triggers `.github/workflows/deploy.yml`, which:
+- Installs dependencies in `frontend/`
+- Builds the React app with `base: "/sharefile/"`
+- Uploads `frontend/dist/` directly as the Pages artifact (with `index.html` at the root)
+- Deploys the actual React application to: `https://nithinreddy0007.github.io/sharefile/`
 
 ---
 
