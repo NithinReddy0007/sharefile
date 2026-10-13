@@ -140,20 +140,17 @@ The repository includes a ready GitHub Actions workflow at `.github/workflows/de
 ### 1. Configure GitHub Repository
 1. Go to your repository on GitHub: `https://github.com/NithinReddy0007/sharefile`.
 2. Navigate to **Settings** > **Pages**.
-3. Under **Build and deployment** > **Source**, select **GitHub Actions**.
-4. Go to **Settings** > **Secrets and variables** > **Actions** > **Variables** tab.
-5. Click **New repository variable**:
+3. Under **Build and deployment** > **Source**, choose:
+   - **Deploy from a branch**
+   - Branch: `gh-pages` / Folder: `/ (root)`
+   - Click **Save**.
+4. (Optional) In **Settings** > **Secrets and variables** > **Actions** > **Variables**, configure:
    - Name: `VITE_API_BASE_URL`
    - Value: `https://qshare-api.<your-subdomain>.workers.dev` (your deployed Worker API URL)
 
 ### 2. Trigger Deployment
-Push the codebase to the `main` branch:
-```bash
-git add .
-git commit -m "feat: complete Qshare file sharing web app"
-git push origin main
-```
-The GitHub Actions workflow will build the React application and deploy it to `https://nithinreddy0007.github.io/sharefile/`.
+Any push to the `main` branch automatically triggers `.github/workflows/deploy-frontend.yml`, which compiles the React frontend with Vite and deploys the production build to the `gh-pages` branch.
+GitHub Pages serves the live app at: `https://nithinreddy0007.github.io/sharefile/`.
 
 ---
 
