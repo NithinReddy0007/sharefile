@@ -1,0 +1,258 @@
+import type { RoomInfo, RoomFile } from './types';
+
+// Configurable API URL via VITE_API_BASE_URL (defaults to local worker: http://127.0.0.1:8787)
+export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8787').replace(/\/+$/, '');
+
+export async function createRoom(): Promise<{
+  roomId: string;
+  passcode: string;
+  createdAt: number;
+  expiresAt: number;
+  maxFileSizeBytes: number;
+  maxRoomSizeBytes: number;
+}> {
+  const res = await fetch(`${API_BASE_URL}/api/rooms`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' }
+  });
+
+  const json = await res.json();
+  if (!res.ok || !json.success) {
+    throw new Error(json.error || `Failed to create room (${res.status})`);
+  }
+  return json.data;
+}
+
+export async function getRoom(roomId: string, passcode: string): Promise<RoomInfo> {
+  const cleanId = roomId.trim().toUpperCase();
+  const cleanPasscode = passcode.trim();
+
+  const res = await fetch(`${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}`, {
+    method: 'GET',
+    headers: {
+      'X-Room-Passcode': cleanPasscode
+    }
+  });
+
+  const json = await res.json();
+  if (!res.ok || !json.success) {
+    throw new Error(json.error || `Failed to access room (${res.status})`);
+  }
+  return json.data;
+}
+
+export interface UploadProgressCallback {
+  (loadedBytes: number, totalBytes: number, percent: number): void;
+}
+
+/**
+ * Upload a file to the room.
+ * For files <= 50MB: Single direct PUT with progress tracking via XMLHttpRequest.
+ * For files > 50MB up to 500MB: Multipart chunked upload (chunks of 10MB) with resume and progress.
+ */
+export async function uploadFileToRoom(
+  roomId: string,
+  passcode: string,
+  file: File,
+  onProgress?: UploadProgressCallback
+): Promise<void> {
+  const cleanId = roomId.trim().toUpperCase();
+  const cleanPasscode = passcode.trim();
+
+  // 1. Initiate upload
+  const initRes = await fetch(`${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}/files`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Room-Passcode': cleanPasscode
+    },
+    body: JSON.stringify({
+      filename: file.name,
+      sizeBytes: file.size,
+      contentType: file.type || 'application/octet-stream'
+    })
+  });
+
+  const initJson = await initRes.json();
+  if (!initRes.ok || !initJson.success) {
+    throw new Error(initJson.error || `Failed to initiate upload (${initRes.status})`);
+  }
+
+  const { fileId, isMultipart, uploadId } = initJson.data;
+
+  // Case A: Small/medium file (Single streaming PUT)
+  if (!isMultipart || !uploadId) {
+    await new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', `${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}/files/${encodeURIComponent(fileId)}`);
+      xhr.setRequestHeader('X-Room-Passcode', cleanPasscode);
+      xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+
+      if (xhr.upload && onProgress) {
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const percent = Math.min(100, Math.round((e.loaded / e.total) * 100));
+            onProgress(e.loaded, e.total, percent);
+          }
+        };
+      }
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          if (onProgress) onProgress(file.size, file.size, 100);
+          resolve();
+        } else {
+          try {
+            const errJson = JSON.parse(xhr.responseText);
+            reject(new Error(errJson.error || `Upload failed with status ${xhr.status}`));
+          } catch {
+            reject(new Error(`Upload failed with status ${xhr.status}`));
+          }
+        }
+      };
+
+      xhr.onerror = () => reject(new Error('Network error during file upload'));
+      xhr.ontimeout = () => reject(new Error('File upload timed out'));
+
+      xhr.send(file);
+    });
+    return;
+  }
+
+  // Case B: Large file (Multipart upload in 10MB chunks without reading entire file into RAM)
+  const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
+  const totalParts = Math.ceil(file.size / CHUNK_SIZE);
+  const parts: { partNumber: number; etag: string }[] = [];
+  let uploadedBytes = 0;
+
+  try {
+    for (let partNumber = 1; partNumber <= totalParts; partNumber++) {
+      const start = (partNumber - 1) * CHUNK_SIZE;
+      const end = Math.min(file.size, start + CHUNK_SIZE);
+      const chunk = file.slice(start, end);
+
+      const partUrl = `${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}/files/${encodeURIComponent(fileId)}/part?partNumber=${partNumber}`;
+      
+      const partRes = await fetch(partUrl, {
+        method: 'PUT',
+        headers: {
+          'X-Room-Passcode': cleanPasscode,
+          'Content-Type': 'application/octet-stream'
+        },
+        body: chunk
+      });
+
+      const partJson = await partRes.json();
+      if (!partRes.ok || !partJson.success) {
+        throw new Error(partJson.error || `Chunk ${partNumber} failed to upload`);
+      }
+
+      parts.push({
+        partNumber,
+        etag: partJson.etag
+      });
+
+      uploadedBytes += (end - start);
+      if (onProgress) {
+        const percent = Math.min(100, Math.round((uploadedBytes / file.size) * 100));
+        onProgress(uploadedBytes, file.size, percent);
+      }
+    }
+
+    // Complete multipart upload
+    const completeRes = await fetch(`${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}/files/${encodeURIComponent(fileId)}/complete`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Room-Passcode': cleanPasscode
+      },
+      body: JSON.stringify({ parts })
+    });
+
+    const completeJson = await completeRes.json();
+    if (!completeRes.ok || !completeJson.success) {
+      throw new Error(completeJson.error || 'Failed to complete multipart upload');
+    }
+
+    if (onProgress) onProgress(file.size, file.size, 100);
+
+  } catch (err) {
+    // Abort multipart upload on error to prevent dangling chunks
+    try {
+      await fetch(`${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}/files/${encodeURIComponent(fileId)}/abort`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Room-Passcode': cleanPasscode
+        }
+      });
+    } catch {
+      // ignore abort error
+    }
+    throw err;
+  }
+}
+
+/**
+ * Download a single file by triggering browser download stream.
+ */
+export async function downloadFile(
+  roomId: string,
+  passcode: string,
+  file: RoomFile,
+  onProgress?: (receivedBytes: number, totalBytes: number, percent: number) => void
+): Promise<void> {
+  const cleanId = roomId.trim().toUpperCase();
+  const cleanPasscode = passcode.trim();
+
+  const url = `${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}/files/${encodeURIComponent(file.id)}/download`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'X-Room-Passcode': cleanPasscode
+    }
+  });
+
+  if (!response.ok) {
+    let err = `Download failed with HTTP ${response.status}`;
+    try {
+      const j = await response.json();
+      if (j.error) err = j.error;
+    } catch {}
+    throw new Error(err);
+  }
+
+  const contentLength = response.headers.get('Content-Length');
+  const total = contentLength ? parseInt(contentLength, 10) : file.size_bytes;
+
+  if (!response.body) {
+    throw new Error('Response body stream is not available');
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      received += value.length;
+      if (onProgress && total > 0) {
+        onProgress(received, total, Math.min(100, Math.round((received / total) * 100)));
+      }
+    }
+  }
+
+  const blob = new Blob(chunks as BlobPart[], { credentials: undefined } as any);
+  const downloadUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = downloadUrl;
+  a.download = file.filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+}

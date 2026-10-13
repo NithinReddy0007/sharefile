@@ -1,0 +1,28 @@
+name = "qshare-api"
+main = "src/index.ts"
+compatibility_date = "2024-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "qshare-db"
+database_id = "local-qshare-db"
+migrations_dir = "migrations"
+
+# R2 Storage bucket binding
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "qshare-files"
+preview_bucket_name = "qshare-files-preview"
+
+# Environment variables
+[vars]
+ALLOWED_ORIGIN = "*"
+MAX_FILE_SIZE_BYTES = 524288000 # 500 MB
+MAX_ROOM_SIZE_BYTES = 1073741824 # 1 GB
+ROOM_TTL_SECONDS = 1800 # 30 minutes
+
+# Scheduled cron trigger for automatic expired rooms cleanup (runs every 10 minutes)
+[triggers]
+crons = ["*/10 * * * *"]
