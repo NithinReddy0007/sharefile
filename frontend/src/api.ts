@@ -1,7 +1,28 @@
 import type { RoomInfo, RoomFile } from './types';
 
-// Configurable API URL via VITE_API_BASE_URL (defaults to local worker: http://127.0.0.1:8787)
-export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8787').replace(/\/+$/, '');
+// Configurable API URL via VITE_API_BASE_URL (defaults to empty string if not provided in production)
+export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+
+export function isApiConfigured(): boolean {
+  return API_BASE_URL.length > 0;
+}
+
+/**
+ * Format user-friendly error messages that diagnose the exact root cause
+ * instead of a raw "Failed to fetch" browser exception.
+ */
+export function formatApiError(err: any): string {
+  if (!isApiConfigured()) {
+    return 'Backend API URL is not configured. Please set the VITE_API_BASE_URL repository variable in GitHub Settings → Secrets and variables → Actions → Variables.';
+  }
+
+  const message = err?.message || String(err);
+  if (message.includes('Failed to fetch') || message.includes('NetworkError') || message.includes('Load failed')) {
+    return `Unable to reach the backend at "${API_BASE_URL}". This usually means the Cloudflare Worker is not deployed yet, is offline, or cross-origin requests (CORS) from GitHub Pages are blocked.`;
+  }
+
+  return message;
+}
 
 export async function createRoom(): Promise<{
   roomId: string;
@@ -13,12 +34,27 @@ export async function createRoom(): Promise<{
   maxFilesPerRoom: number;
   maxConcurrentUploads: number;
 }> {
-  const res = await fetch(`${API_BASE_URL}/api/rooms`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' }
-  });
+  if (!isApiConfigured()) {
+    throw new Error('Backend API URL is not configured. Please deploy the Cloudflare Worker and configure VITE_API_BASE_URL in your GitHub repository.');
+  }
 
-  const json = await res.json();
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE_URL}/api/rooms`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (netErr) {
+    throw new Error(formatApiError(netErr));
+  }
+
+  let json: any;
+  try {
+    json = await res.json();
+  } catch {
+    throw new Error(`Server returned status ${res.status} with invalid response`);
+  }
+
   if (!res.ok || !json.success) {
     throw new Error(json.error || `Failed to create room (${res.status})`);
   }
@@ -26,17 +62,32 @@ export async function createRoom(): Promise<{
 }
 
 export async function getRoom(roomId: string, passcode: string): Promise<RoomInfo> {
+  if (!isApiConfigured()) {
+    throw new Error('Backend API URL is not configured. Please deploy the Cloudflare Worker and configure VITE_API_BASE_URL in your GitHub repository.');
+  }
+
   const cleanId = roomId.trim().toUpperCase();
   const cleanPasscode = passcode.trim();
 
-  const res = await fetch(`${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}`, {
-    method: 'GET',
-    headers: {
-      'X-Room-Passcode': cleanPasscode
-    }
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}`, {
+      method: 'GET',
+      headers: {
+        'X-Room-Passcode': cleanPasscode
+      }
+    });
+  } catch (netErr) {
+    throw new Error(formatApiError(netErr));
+  }
 
-  const json = await res.json();
+  let json: any;
+  try {
+    json = await res.json();
+  } catch {
+    throw new Error(`Server returned status ${res.status} with invalid response`);
+  }
+
   if (!res.ok || !json.success) {
     throw new Error(json.error || `Failed to access room (${res.status})`);
   }
@@ -58,25 +109,43 @@ export async function uploadFileToRoom(
   file: File,
   onProgress?: UploadProgressCallback
 ): Promise<void> {
+  if (!isApiConfigured()) {
+    throw new Error('Backend API URL is not configured.');
+  }
+
   const cleanId = roomId.trim().toUpperCase();
   const cleanPasscode = passcode.trim();
 
   // 1. Initiate upload
-  const initRes = await fetch(`${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}/files`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Room-Passcode': cleanPasscode
-    },
-    body: JSON.stringify({
-      filename: file.name,
-      sizeBytes: file.size,
-      contentType: file.type || 'application/octet-stream'
-    })
-  });
+  let initRes: Response;
+  try {
+    initRes = await fetch(`${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}/files`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Room-Passcode': cleanPasscode
+      },
+      body: JSON.stringify({
+        filename: file.name,
+        sizeBytes: file.size,
+        contentType: file.type || 'application/octet-stream'
+      })
+    });
+  } catch (netErr) {
+    throw new Error(formatApiError(netErr));
+  }
 
-  const initJson = await initRes.json();
+  let initJson: any;
+  try {
+    initJson = await initRes.json();
+  } catch {
+    throw new Error(`Upload initialization returned HTTP ${initRes.status}`);
+  }
+
   if (!initRes.ok || !initJson.success) {
+    if (initRes.status === 503) {
+      throw new Error(initJson.error || 'Cloud storage bucket is not configured on the backend.');
+    }
     throw new Error(initJson.error || `Failed to initiate upload (${initRes.status})`);
   }
 
@@ -113,8 +182,8 @@ export async function uploadFileToRoom(
         }
       };
 
-      xhr.onerror = () => reject(new Error('Network error during file upload'));
-      xhr.ontimeout = () => reject(new Error('File upload timed out'));
+      xhr.onerror = () => reject(new Error('Network or CORS error while uploading file data to the server.'));
+      xhr.ontimeout = () => reject(new Error('File upload timed out.'));
 
       xhr.send(file);
     });
@@ -179,7 +248,6 @@ export async function uploadFileToRoom(
     if (onProgress) onProgress(file.size, file.size, 100);
 
   } catch (err) {
-    // Abort multipart upload on error to prevent dangling chunks
     try {
       await fetch(`${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}/files/${encodeURIComponent(fileId)}/abort`, {
         method: 'POST',
@@ -188,9 +256,7 @@ export async function uploadFileToRoom(
           'X-Room-Passcode': cleanPasscode
         }
       });
-    } catch {
-      // ignore abort error
-    }
+    } catch {}
     throw err;
   }
 }
@@ -204,17 +270,26 @@ export async function downloadFile(
   file: RoomFile,
   onProgress?: (receivedBytes: number, totalBytes: number, percent: number) => void
 ): Promise<void> {
+  if (!isApiConfigured()) {
+    throw new Error('Backend API URL is not configured.');
+  }
+
   const cleanId = roomId.trim().toUpperCase();
   const cleanPasscode = passcode.trim();
 
   const url = `${API_BASE_URL}/api/rooms/${encodeURIComponent(cleanId)}/files/${encodeURIComponent(file.id)}/download`;
 
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'X-Room-Passcode': cleanPasscode
-    }
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'X-Room-Passcode': cleanPasscode
+      }
+    });
+  } catch (netErr) {
+    throw new Error(formatApiError(netErr));
+  }
 
   if (!response.ok) {
     let err = `Download failed with HTTP ${response.status}`;

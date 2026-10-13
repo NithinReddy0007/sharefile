@@ -143,4 +143,26 @@
 - **Deployment Status**:
   - GitHub Pages Deployment: Managed via `.github/workflows/deploy.yml` with official `actions/upload-pages-artifact@v3` and `actions/deploy-pages@v4`.
   - Publishing Source requirement: GitHub Repository **Settings → Pages → Build and deployment → Source** must be set to **GitHub Actions**.
-  - Worker API: Separately deployable Cloudflare Worker with D1 database and R2 bucket.
+  - Worker API: Cloudflare Worker configured with D1 database (`c018ab94-d115-4288-808d-ae88b7dea758`).
+
+---
+
+## 10. Diagnosis & Zero-Card Storage Architecture
+
+### A. Root Cause of "Failed to fetch" on Deployed Site
+1. **Unconfigured `VITE_API_BASE_URL`**:
+   The deployed frontend at `https://nithinreddy0007.github.io/sharefile/` was compiled with the default local fallback (`http://127.0.0.1:8787`). When users clicked "Send Files" on the live web, their browser attempted an HTTP request to `http://127.0.0.1:8787/api/rooms`. Because the user's computer is not running a local worker, the browser blocked or refused the connection, resulting in `Failed to fetch`.
+2. **Undeployed Worker**:
+   The Cloudflare Worker deployment was blocked because `wrangler deploy` was attempting to bind to the `qshare-files` R2 bucket, which Cloudflare rejected with Error 10042 (Cloudflare requires a verified payment method on file to provision R2 buckets, even though R2 has a 10 GB free tier).
+3. **CORS Configuration**:
+   The Worker CORS configuration has now been hardened to explicitly permit `https://nithinreddy0007.github.io` alongside localhost development origins, with full preflight `OPTIONS` handling and `Vary: Origin` headers.
+
+### B. Storage Provider Alternatives Analysis (Zero Credit Card Required)
+Cloudflare R2 blocks bucket creation without billing details (Error 10042). Because you do not want to provide credit card or PayPal details, here is the factual evaluation of genuine zero-card alternatives:
+
+| Provider | Free Tier (No Card Required) | Max File Size | Upload Architecture | Suitability for Qshare |
+|---|---|---|---|---|
+| **Supabase Storage** | 1 GB total storage, 50 MB max per file on free tier | 50 MB limit | S3-compatible or REST API | **Limited**: 50 MB limit falls short of the 100 MiB per-file requirement. |
+| **Backblaze B2** | 10 GB free storage forever, 1 GB/day free egress | Up to 5 TB per file | Full S3-compatible API | **Recommended**: Fully S3-compatible, supports 100 MiB+ files, no payment method required for free tier signup. |
+| **Cloudflare D1 (Raw BLOBs)** | 5 GB storage, 100k writes/month | 2 MB max per SQLite row | Chunked rows in D1 | **Viable Workaround within current stack**: Stores 100 MiB files as 1 MB chunk rows directly in the already-created D1 database. Operates 100% inside your existing card-free Cloudflare setup. |
+

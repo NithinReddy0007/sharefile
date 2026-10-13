@@ -24,21 +24,37 @@ function checkRateLimit(ip: string, limit = 120, windowMs = 60_000): boolean {
   return true;
 }
 
+/**
+ * Robust CORS headers handling:
+ * Allows GitHub Pages origin (https://nithinreddy0007.github.io) and local dev (localhost/127.0.0.1)
+ */
 export function handleCors(request: Request, env: Env): Headers {
   const headers = new Headers();
-  const origin = request.headers.get('Origin') || '*';
-  const allowed = env.ALLOWED_ORIGIN || '*';
+  const requestOrigin = request.headers.get('Origin');
+  const configuredOrigin = env.ALLOWED_ORIGIN || '*';
 
-  if (allowed === '*' || allowed.includes(origin)) {
-    headers.set('Access-Control-Allow-Origin', origin);
+  // Allowed origins list
+  const trustedOrigins = [
+    'https://nithinreddy0007.github.io',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000'
+  ];
+
+  if (configuredOrigin === '*') {
+    headers.set('Access-Control-Allow-Origin', requestOrigin || '*');
+  } else if (requestOrigin && (configuredOrigin.includes(requestOrigin) || trustedOrigins.includes(requestOrigin))) {
+    headers.set('Access-Control-Allow-Origin', requestOrigin);
   } else {
-    headers.set('Access-Control-Allow-Origin', allowed);
+    headers.set('Access-Control-Allow-Origin', configuredOrigin);
   }
 
   headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Room-Passcode, Range');
   headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Disposition, ETag');
   headers.set('Access-Control-Max-Age', '86400');
+  headers.set('Vary', 'Origin');
   return headers;
 }
 
@@ -74,22 +90,23 @@ export async function cleanupExpiredRooms(env: Env): Promise<{ deletedRooms: num
       ).bind(room.id).all<{ id: string; storage_key: string; upload_id?: string | null }>();
 
       if (files.results && files.results.length > 0) {
-        // Abort any lingering multipart uploads and delete objects from R2
-        for (const f of files.results) {
-          if (f.upload_id) {
-            try {
-              const mp = env.BUCKET.resumeMultipartUpload(f.storage_key, f.upload_id);
-              await mp.abort();
-            } catch {}
+        if (env.BUCKET) {
+          for (const f of files.results) {
+            if (f.upload_id) {
+              try {
+                const mp = env.BUCKET.resumeMultipartUpload(f.storage_key, f.upload_id);
+                await mp.abort();
+              } catch {}
+            }
           }
-        }
 
-        const keys = files.results.map(f => f.storage_key);
-        try {
-          await env.BUCKET.delete(keys);
-          deletedFilesCount += keys.length;
-        } catch (err) {
-          console.error(`Failed to delete R2 files for room ${room.id}:`, err);
+          const keys = files.results.map(f => f.storage_key);
+          try {
+            await env.BUCKET.delete(keys);
+            deletedFilesCount += keys.length;
+          } catch (err) {
+            console.error(`Failed to delete R2 files for room ${room.id}:`, err);
+          }
         }
       }
 
@@ -111,15 +128,17 @@ export async function cleanupExpiredRooms(env: Env): Promise<{ deletedRooms: num
 
   if (stalePendingFiles.results && stalePendingFiles.results.length > 0) {
     for (const f of stalePendingFiles.results) {
-      if (f.upload_id) {
+      if (env.BUCKET) {
+        if (f.upload_id) {
+          try {
+            const mp = env.BUCKET.resumeMultipartUpload(f.storage_key, f.upload_id);
+            await mp.abort();
+          } catch {}
+        }
         try {
-          const mp = env.BUCKET.resumeMultipartUpload(f.storage_key, f.upload_id);
-          await mp.abort();
+          await env.BUCKET.delete(f.storage_key);
         } catch {}
       }
-      try {
-        await env.BUCKET.delete(f.storage_key);
-      } catch {}
       await env.DB.prepare(`DELETE FROM files WHERE id = ?`).bind(f.id).run();
     }
   }
@@ -160,12 +179,17 @@ export default {
     const roomTtlSeconds = Number(env.ROOM_TTL_SECONDS || 1800);
 
     try {
-      // Health check & cleanup trigger route
+      // Health check & storage readiness check
       if (path === '' || path === '/api/health') {
+        const hasBucket = !!env.BUCKET;
+        const hasDB = !!env.DB;
+
         return jsonResponse({
           success: true,
           status: 'healthy',
           service: 'Qshare API',
+          storageConfigured: hasBucket,
+          databaseConfigured: hasDB,
           timestamp: Math.floor(Date.now() / 1000)
         }, 200, corsHeaders);
       }
@@ -279,6 +303,14 @@ export default {
       // 3. INITIATE FILE UPLOAD: POST /api/rooms/:roomId/files
       // ==========================================
       if (subPath === '/files' && request.method === 'POST') {
+        // Guard: check if storage bucket is bound
+        if (!env.BUCKET) {
+          return jsonResponse({
+            success: false,
+            error: 'Storage bucket is not bound or configured. Please configure an R2 bucket or zero-card storage provider.'
+          }, 503, corsHeaders);
+        }
+
         const body = await request.json() as { filename?: string; sizeBytes?: number; contentType?: string };
         const filename = (body.filename || 'unnamed-file').trim();
         const sizeBytes = Number(body.sizeBytes);
@@ -309,8 +341,7 @@ export default {
           }, 400, corsHeaders);
         }
 
-        // 3. Room capacity check with concurrency protection:
-        // Sum total size of uploaded files PLUS in-flight pending files
+        // 3. Room capacity check with concurrency protection
         const inFlightSizeResult = await env.DB.prepare(
           `SELECT TOTAL(size_bytes) as total_allocated FROM files WHERE room_id = ? AND status IN ('uploaded', 'pending')`
         ).bind(roomId).first<{ total_allocated: number }>();
@@ -371,14 +402,19 @@ export default {
           return jsonResponse({ success: false, error: 'File record not found' }, 404, corsHeaders);
         }
 
+        if (!env.BUCKET) {
+          return jsonResponse({
+            success: false,
+            error: 'Storage bucket is not bound or configured.'
+          }, 503, corsHeaders);
+        }
+
         // Direct single-put body upload: PUT /api/rooms/:roomId/files/:fileId
         if (action === '' && request.method === 'PUT') {
           if (!request.body) {
             return jsonResponse({ success: false, error: 'Missing request body' }, 400, corsHeaders);
           }
 
-          // Stream body directly into R2 while counting actual received bytes
-          // TransformStream allows metering chunks as they stream through to R2
           let actualReceivedBytes = 0;
           let limitExceeded = false;
 
@@ -395,7 +431,6 @@ export default {
           });
 
           try {
-            // Pipe request.body through metering stream into R2
             const pipePromise = request.body.pipeTo(writable);
             const putPromise = env.BUCKET.put(file.storage_key, readable, {
               httpMetadata: {
@@ -409,7 +444,6 @@ export default {
 
             await Promise.all([pipePromise, putPromise]);
           } catch (uploadErr: any) {
-            // Interrupted or failed upload: clean up R2 object and delete incomplete file record
             try {
               await env.BUCKET.delete(file.storage_key);
             } catch {}
@@ -428,17 +462,14 @@ export default {
             }, 500, corsHeaders);
           }
 
-          // If actual received bytes mismatch significantly or exceed max room capacity
           const finalSize = actualReceivedBytes > 0 ? actualReceivedBytes : file.size_bytes;
 
-          // Double check room capacity with final actual size
           const currentTotalResult = await env.DB.prepare(
             `SELECT TOTAL(size_bytes) as total FROM files WHERE room_id = ? AND status = 'uploaded'`
           ).bind(roomId).first<{ total: number }>();
 
           const currentTotal = currentTotalResult?.total || 0;
           if (currentTotal + finalSize > maxRoomSizeBytes) {
-            // Over room quota! Clean up R2 and remove pending file
             try {
               await env.BUCKET.delete(file.storage_key);
             } catch {}
@@ -449,7 +480,6 @@ export default {
             }, 400, corsHeaders);
           }
 
-          // Mark file as uploaded and atomically update room total size
           await env.DB.batch([
             env.DB.prepare(
               `UPDATE files SET status = 'uploaded', size_bytes = ?, uploaded_at = ? WHERE id = ?`
@@ -507,7 +537,6 @@ export default {
 
             const finalSize = completedObj.size || file.size_bytes;
 
-            // Check room capacity limit before finalizing
             const currentTotalResult = await env.DB.prepare(
               `SELECT TOTAL(size_bytes) as total FROM files WHERE room_id = ? AND status = 'uploaded'`
             ).bind(roomId).first<{ total: number }>();
@@ -563,7 +592,6 @@ export default {
             return jsonResponse({ success: false, error: 'File is not yet available for download' }, 400, corsHeaders);
           }
 
-          // Support Range headers for resuming/chunked downloads
           const rangeHeader = request.headers.get('Range');
           let range: R2Range | undefined = undefined;
 
@@ -589,7 +617,6 @@ export default {
 
           const responseHeaders = new Headers(corsHeaders);
           responseHeaders.set('Content-Type', file.content_type || 'application/octet-stream');
-          // RFC 5987 encoded filename for safe unicode & spaces
           const encodedFilename = encodeURIComponent(file.filename);
           responseHeaders.set('Content-Disposition', `attachment; filename="${file.filename.replace(/"/g, '')}"; filename*=UTF-8''${encodedFilename}`);
           responseHeaders.set('Cache-Control', 'private, no-cache, no-store, must-revalidate');
